@@ -738,6 +738,253 @@ def compute_optimized_scenario(
     }
 
 
+def compute_relay_scenario(
+    total_range_m: float,
+    n_hops: int,
+    power_kw: float,
+    condition: str,
+    per_hop_conditions: list = None,
+) -> dict:
+    """
+    Multi-hop relay WPT simulation (laser only).
+
+    Architecture:
+      Source → [hop 1 atmo] → Relay1(PV→DC→laser) → [hop 2 atmo] → ... → [hop N atmo] → Final PV→DC
+
+    Relay node efficiency chain:
+      optical_in → (path: geo × atmo × turbulence) → PV cells → DC
+      → power conditioning → drive new laser → optical_out_relay
+      dc_per_optical = compute_laser_link result for 1W optical input
+      relay_optical_out = dc_per_optical × (laser_WPE / power_cond)
+                        = dc_per_optical × (0.40 / 0.95)
+
+    The REAL advantage of relay:
+      - Mixed conditions: 2km smoke + 3km clear delivers far more than 5km smoke direct
+      - Range extension: relay makes ultra-long-range feasible even if inefficient
+      - First hop: even 1km smoke gives 300-680W per 5kW source (useful for relay drones)
+
+    Fog in any hop = hard block (that hop delivers 0W).
+
+    Returns:
+      per_hop_results, total_efficiency_pct, total_delivered_kw, total_input_kw,
+      direct_efficiency_pct, relay_advantage_db, feasibility_ok, and more.
+    """
+    from .laser import (
+        LaserBeam, LaserReceiver, AtmosphericConditions as LaserAtmo,
+        compute_laser_link, FOG_HARD_BLOCK_CONDITIONS,
+    )
+
+    # Constants
+    LASER_WPE = 0.40          # Wall-plug efficiency of source / relay laser
+    POWER_COND = 0.95         # DC-DC converter in relay node
+    # relay optical efficiency per received optical watt:
+    #   dc_per_optical × LASER_WPE / POWER_COND  (DC → new laser optical out)
+    RELAY_OPTICAL_FACTOR = LASER_WPE / POWER_COND   # ≈ 0.4211
+
+    # Standard optics (same as compute_scenario)
+    beam_waist_m = 0.05
+    pv_aperture_m = 0.30
+    pv_type = "gaas"
+
+    hop_range_m = total_range_m / n_hops
+    hop_range_km = hop_range_m / 1000.0
+    total_range_km = total_range_m / 1000.0
+    conditions = list(per_hop_conditions) if per_hop_conditions else [condition] * n_hops
+
+    if len(conditions) != n_hops:
+        raise ValueError(f"per_hop_conditions length {len(conditions)} must equal n_hops {n_hops}")
+
+    # ── Compute per-hop dc efficiency (dc out per 1W optical input) ───────
+    beam_1w = LaserBeam(output_power_w=1.0, waist_radius_m=beam_waist_m)
+    receiver = LaserReceiver(pv_type=pv_type, aperture_radius_m=pv_aperture_m)
+
+    hop_dc_per_optical = []    # dc out per W optical in, for each hop
+    hop_fog_blocked = []
+
+    for i, cond in enumerate(conditions):
+        atmo = LaserAtmo(condition=cond)
+        r = compute_laser_link(hop_range_m, beam_1w, receiver, atmo)
+        hop_dc_per_optical.append(r.dc_output_w)   # dc W per 1 W optical input
+        hop_fog_blocked.append(cond in FOG_HARD_BLOCK_CONDITIONS)
+
+    # ── Compute total chain efficiency ────────────────────────────────────
+    # Work through the chain:
+    #   After hop i (intermediate relay): optical_factor_i = dc_per_optical[i] × RELAY_OPTICAL_FACTOR
+    #   After final hop N: dc_factor_N = dc_per_optical[N-1]
+    #   CHAIN_EFF = product(optical_factor[0..N-2]) × dc_per_optical[N-1]
+    #
+    # If any hop is fog-blocked, the whole chain is blocked.
+
+    any_fog = any(hop_fog_blocked)
+
+    chain_optical_mult = 1.0   # running multiplier of optical power from source
+    per_hop_results = []
+
+    # We'll simulate by tracking optical power forward, normalizing to 1W source optical
+    optical_in_normalized = 1.0   # W source optical
+
+    for i in range(n_hops):
+        dc_eff = hop_dc_per_optical[i]   # dc per 1W of optical into this hop
+        fog_blocked = hop_fog_blocked[i]
+
+        optical_into_hop = optical_in_normalized   # optical power entering this hop (normalized)
+
+        if fog_blocked:
+            dc_out_normalized = 0.0
+            optical_out_relay_normalized = 0.0
+            atmo_loss_db = 999.0
+        else:
+            dc_out_normalized = optical_into_hop * dc_eff
+            # For intermediate relay nodes: DC → new laser
+            if i < n_hops - 1:
+                optical_out_relay_normalized = dc_out_normalized * RELAY_OPTICAL_FACTOR
+            else:
+                optical_out_relay_normalized = 0.0   # last hop: DC delivered directly
+
+        # Atmospheric loss for this hop (for display)
+        from .laser import ATMO_CONDITIONS
+        beta = ATMO_CONDITIONS.get(conditions[i], 0.0115)
+        atmo_loss_db = beta * hop_range_km * 10 / np.log(10) if not fog_blocked else 999.0
+
+        per_hop_results.append({
+            "hop": i + 1,
+            "condition": conditions[i],
+            "range_km": round(hop_range_km, 3),
+            "fog_blocked": fog_blocked,
+            "atmo_loss_db": round(atmo_loss_db, 2),
+            "dc_efficiency_pct": round(dc_eff * 100, 4),
+            # Actual values filled in after we solve for source power (scale factor applied below)
+            "_optical_in_norm": round(optical_into_hop, 8),
+            "_dc_out_norm": round(dc_out_normalized, 8),
+            "_optical_out_relay_norm": round(optical_out_relay_normalized, 8),
+        })
+
+        # Update for next hop
+        optical_in_normalized = optical_out_relay_normalized
+
+    # ── Overall chain dc efficiency (dc_delivered / source_optical) ───────
+    # chain_dc_eff = product of relay optical factors for hops 0..N-2, times dc_per_optical[N-1]
+    chain_dc_eff = per_hop_results[0]["_dc_out_norm"] / 1.0   # already computed above
+    # Actually recompute cleanly:
+    chain_dc_eff = 1.0
+    for i in range(n_hops - 1):
+        if hop_fog_blocked[i]:
+            chain_dc_eff = 0.0
+            break
+        chain_dc_eff *= hop_dc_per_optical[i] * RELAY_OPTICAL_FACTOR
+    if not any_fog or not hop_fog_blocked[n_hops - 1]:
+        chain_dc_eff *= hop_dc_per_optical[n_hops - 1]
+    else:
+        chain_dc_eff = 0.0
+
+    # Total system efficiency = dc_delivered / wall_plug_input
+    # wall_plug = source_optical / LASER_WPE
+    # dc_delivered = source_optical × chain_dc_eff
+    # total_sys_eff = chain_dc_eff × LASER_WPE
+    total_sys_eff = chain_dc_eff * LASER_WPE
+
+    # ── Solve for required source optical power ───────────────────────────
+    target_power_w = power_kw * 1000.0
+    if chain_dc_eff > 0:
+        source_optical_w = target_power_w / chain_dc_eff
+        wall_plug_input_w = source_optical_w / LASER_WPE
+        delivered_dc_w = target_power_w
+    else:
+        # Fog blocked or zero efficiency
+        source_optical_w = 0.0
+        wall_plug_input_w = 0.0
+        delivered_dc_w = 0.0
+
+    # ── Scale per-hop results to actual power ─────────────────────────────
+    if source_optical_w > 0:
+        scale = source_optical_w
+    else:
+        scale = 0.0
+
+    for h in per_hop_results:
+        h["optical_in_kw"] = round(h["_optical_in_norm"] * scale / 1000.0, 4)
+        h["dc_out_kw"] = round(h["_dc_out_norm"] * scale / 1000.0, 4)
+        h["optical_out_relay_kw"] = round(h["_optical_out_relay_norm"] * scale / 1000.0, 4)
+        # Clean up internal keys
+        del h["_optical_in_norm"], h["_dc_out_norm"], h["_optical_out_relay_norm"]
+
+    # ── Direct shot comparison ────────────────────────────────────────────
+    try:
+        direct = compute_scenario(
+            mode="laser",
+            range_m=total_range_m,
+            target_power_kw=power_kw,
+            condition=condition,
+        )
+        direct_eff_pct = direct.get("system_efficiency_pct", 0.0)
+        direct_dc_kw = direct.get("dc_power_delivered_kw", 0.0)
+        direct_input_kw = direct.get("electrical_input_kw", 0.0)
+    except Exception:
+        direct_eff_pct = 0.0
+        direct_dc_kw = 0.0
+        direct_input_kw = 0.0
+
+    # ── Relay advantage in dB ─────────────────────────────────────────────
+    relay_eff_pct = total_sys_eff * 100.0
+    if relay_eff_pct > 0 and direct_eff_pct > 0:
+        relay_advantage_db = 10.0 * np.log10(relay_eff_pct / direct_eff_pct)
+    elif relay_eff_pct > 0:
+        relay_advantage_db = 30.0   # symbolic: relay works, direct doesn't
+    elif direct_eff_pct > 0:
+        relay_advantage_db = -30.0  # symbolic: direct works, relay doesn't
+    else:
+        relay_advantage_db = 0.0
+
+    feasibility_ok = bool((not any_fog) and (total_sys_eff > 0))
+
+    # ── Build narrative note ──────────────────────────────────────────────
+    if any_fog:
+        note = (
+            f"FOG HARD BLOCK in one or more hops — relay chain not viable. "
+            f"Fog makes laser WPT impossible regardless of relay count."
+        )
+    elif chain_dc_eff > 0:
+        first_hop_dc = per_hop_results[0]["dc_out_kw"]
+        note = (
+            f"Relay chain ({n_hops}×{hop_range_km:.1f}km) delivers {delivered_dc_w/1000:.3f}kW "
+            f"vs direct shot {direct_dc_kw:.3f}kW at {total_range_km:.1f}km. "
+            f"First relay node receives {first_hop_dc:.3f}kW DC. "
+            f"Relay advantage: {relay_advantage_db:+.1f}dB."
+        )
+    else:
+        note = "Zero chain efficiency — check hop conditions."
+
+    return {
+        "total_range_km": round(total_range_km, 3),
+        "n_hops": n_hops,
+        "hop_range_km": round(hop_range_km, 3),
+        "conditions": conditions,
+        "uniform_condition": condition,
+        # Relay results
+        "per_hop_results": per_hop_results,
+        "total_delivered_kw": round(delivered_dc_w / 1000.0, 6),
+        "total_efficiency_pct": round(relay_eff_pct, 6),
+        "total_input_kw": round(wall_plug_input_w / 1000.0, 4),
+        "source_optical_kw": round(source_optical_w / 1000.0, 4),
+        "chain_dc_eff": round(chain_dc_eff, 8),
+        # Direct shot comparison
+        "direct_efficiency_pct": round(direct_eff_pct, 4),
+        "direct_delivered_kw": round(direct_dc_kw, 4),
+        "direct_input_kw": round(direct_input_kw, 4),
+        # Relay advantage
+        "relay_advantage_db": round(relay_advantage_db, 2),
+        # Feasibility
+        "feasibility_ok": feasibility_ok,
+        "any_fog_blocked": any_fog,
+        "note": note,
+        # Physics constants used
+        "_relay_node_pv_eff": 0.43,       # approx PV efficiency at relay node
+        "_relay_optical_factor": round(RELAY_OPTICAL_FACTOR, 4),
+        "_laser_wpe": LASER_WPE,
+        "_power_cond": POWER_COND,
+    }
+
+
 def print_scenario_report(s: dict) -> str:
     lines = [
         "=" * 65,

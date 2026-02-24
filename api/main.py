@@ -26,6 +26,7 @@ from src.scenarios import (
     run_mvp_scenario,
     compute_space_scenario,
     compute_optimized_scenario,
+    compute_relay_scenario,
 )
 from src.financial import (
     FinancialAssumptions,
@@ -53,13 +54,15 @@ def make_serializable(obj: Any) -> Any:
         return [make_serializable(v) for v in obj]
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         return make_serializable(dataclasses.asdict(obj))
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
         v = float(obj)
         return None if math.isnan(v) or math.isinf(v) else v
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
     if isinstance(obj, float):
         return None if math.isnan(obj) or math.isinf(obj) else obj
     if isinstance(obj, bool):
@@ -125,6 +128,22 @@ class OptimizedRequest(BaseModel):
     power_kw: float = Field(5.0, ge=0.1, le=500)
     condition: str = Field("clear")
     optimizations: List[str] = Field(["all"])
+
+
+class RelayRequest(BaseModel):
+    total_range_m: float = Field(5000.0, ge=500, le=50000,
+                                  description="Total path length (m)")
+    n_hops: int = Field(5, ge=2, le=20,
+                        description="Number of relay hops (2–20)")
+    power_kw: float = Field(5.0, ge=0.1, le=500,
+                             description="Target delivered DC power (kW)")
+    condition: str = Field("smoke",
+                           description="Uniform condition: clear/haze/smoke/rain/fog")
+    per_hop_conditions: Optional[List[str]] = Field(
+        None,
+        description="Per-hop condition overrides (list of n_hops strings). "
+                    "Overrides global condition when provided.",
+    )
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
@@ -305,6 +324,35 @@ def simulate_optimized(req: OptimizedRequest):
             optimizations=req.optimizations,
         )
         return make_serializable(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/simulate/relay")
+def simulate_relay(req: RelayRequest):
+    """
+    Multi-hop relay WPT simulation (laser).
+
+    Computes the physics of an N-hop laser relay chain, where each intermediate
+    relay drone receives laser power, converts to DC, and retransmits a new beam.
+
+    Returns per-hop power budget, chain efficiency, direct-shot comparison,
+    and relay advantage in dB.
+
+    Use `per_hop_conditions` to model mixed atmospheric segments (e.g. smoke
+    for the first 2km, clear for the last 3km) — this is the primary relay advantage.
+    """
+    try:
+        result = compute_relay_scenario(
+            total_range_m=req.total_range_m,
+            n_hops=req.n_hops,
+            power_kw=req.power_kw,
+            condition=req.condition,
+            per_hop_conditions=req.per_hop_conditions,
+        )
+        return make_serializable(result)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
