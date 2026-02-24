@@ -134,7 +134,7 @@ def simulate(req: SimulateRequest):
                 mode="microwave",
                 range_m=req.range_m,
                 target_power_kw=req.power_kw,
-                condition=req.condition if req.condition not in ["smoke"] else "clear",
+                condition=req.condition,  # condition normalization handled inside compute_scenario
             )
             result = {
                 "mode": "compare",
