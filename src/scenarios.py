@@ -270,7 +270,7 @@ def compute_scenario(
             "rayleigh_distance_m":   round(result_dict.get("rayleigh_distance_m", 0), 1),
             "condition_mapped":      condition_norm,
             # Honest disclosure: what target delivery would require
-            "to_deliver_target_kw":  f"{target_power_kw} kW requires: {req_hw['note']}",
+            "to_deliver_target_kw":  req_hw['note'],
         }
 
     else:
