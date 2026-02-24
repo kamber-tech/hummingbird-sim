@@ -660,21 +660,25 @@ def compute_optimized_scenario(
         )
 
     if "inp_cells" in optimizations and mode == "laser":
-        # InP cells: 55% vs default 35% PV efficiency
+        # InP cells: 55% vs base GaAs 50% monochromatic PV efficiency
+        # Both subject to same 0.86 temperature derating → effective gain = 55/50 = 1.10x
         # Reference: Alta Devices/NextGen Solar 55.2% at 1070nm monochromatic (2023)
-        inp_factor = 0.55 / 0.35
+        inp_factor = 0.55 / 0.50
         opt_eff *= inp_factor
         improvement_notes.append(
-            f"InP PV cells: {0.55/0.35:.1f}x efficiency gain (55% vs 35%)"
+            f"InP PV cells: {inp_factor:.2f}x efficiency gain (55% vs 50% GaAs monochromatic)"
         )
 
     if "large_aperture" in optimizations:
         if mode == "laser":
-            # 4x aperture area → 4x geometric collection
-            aperture_factor = 4.0
+            # Larger TX/RX aperture: reduces beam divergence and turbulence effect.
+            # At short range (geo_coll already ~1.0), benefit is reduced turbulence and
+            # improved Strehl; at long range, benefit is tighter beam → better capture.
+            # Conservative 2x improvement (not 4x — baseline already has full geometric capture).
+            aperture_factor = 2.0
             opt_eff *= aperture_factor
             improvement_notes.append(
-                f"Large aperture (2x diameter = 4x area): {aperture_factor}x collection"
+                f"Large aperture (2x area): ~{aperture_factor}x improvement from tighter beam + reduced turbulence"
             )
         else:
             # For microwave: 2x elements → 4x received power (P_rx ∝ n²)
@@ -692,8 +696,15 @@ def compute_optimized_scenario(
             f"High-density rectenna array: {rectenna_factor:.1f}x RF-DC conversion"
         )
 
-    # Cap at physical maximum (DARPA PRAD anchor ~20%, theoretical max ~35%)
-    opt_eff = min(opt_eff, 35.0)
+    # Range-dependent efficiency cap:
+    # Near-field (0.5km): up to 33%, 2km: ~29%, 5km: ~23%, 8.6km: ~18.8%
+    # Anchored to DARPA POWER PRAD 2025: 800W @ 8.6km ≈ 20% end-to-end (best hardware)
+    range_km = range_m / 1000.0
+    if mode == "laser":
+        max_eff = 35.0 / (1.0 + range_km / 10.0)
+    else:
+        max_eff = 10.0 / (1.0 + range_km / 5.0)   # microwave optimized caps lower
+    opt_eff = min(opt_eff, max_eff)
 
     # Scale DC delivered proportionally
     base_dc = base.get("dc_power_delivered_kw", 0)

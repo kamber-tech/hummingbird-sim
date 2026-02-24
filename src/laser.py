@@ -40,7 +40,7 @@ ATMO_CONDITIONS = {
     "haze":       0.230,   # ≈1.0  dB/km  — light haze (0.5–2 dB/km range)
     "light_fog":  1.15,    # ≈5.0  dB/km  — light fog; HARD BLOCK above ~2 km
     "fog":        6.91,    # ≈30.0 dB/km  — dense fog; HARD BLOCK at any range
-    "smoke":      1.15,    # ≈5.0  dB/km  — battlefield smoke (similar to light fog)
+    "smoke":      1.84,    # ≈8.0  dB/km  — dense battlefield smoke (MIL-C-70214B; 5-15 dB/km range)
     "dust":       0.693,   # ≈3.0  dB/km  — desert dust storm
     "rain":       0.046,   # ≈0.20 dB/km  — validated rain (0.09–0.35 dB/km range)
                            #                 Note: rain is mild for laser vs fog/cloud
